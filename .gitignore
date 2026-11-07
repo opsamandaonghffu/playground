@@ -1,0 +1,8 @@
+# 用户填的凭据，绝不进仓库
+komari.conf
+.komari-runtime.json
+komari-agent.log
+komari-agent
+.proc-shim/
+SillyTavern/
+*.log
