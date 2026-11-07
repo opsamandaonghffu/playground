@@ -2,8 +2,9 @@
 
 一套文件，Wispbyte 免费容器（512 MB / 1 GB / Node.js 镜像）里同时跑云酒馆和 Komari 性能探针。
 
-**重点：探针上报的是容器自己的 CPU / 内存 / 磁盘 / 网络，不是宿主机。**
-详见下方「为什么不会探到宿主机」。
+**两个重点：**
+1. 探针上报的是**容器自己**的 CPU / 内存 / 磁盘 / 网络，不是宿主机（见「四」）。
+2. 内置 **CPU 限额 + 跳过前端编译**，专门解决平台「平均 CPU 使用率过高 → 自动停服」（见「三·六」）。
 
 ---
 
@@ -13,8 +14,12 @@
 |---|---|
 | `start.sh` | **主入口**，Startup Command 填 `sh /home/container/start.sh` |
 | `index.js` | **兜底入口**：面板只允许指定 `node <主文件>` 时，把主文件指向它，由它转交 `start.sh` |
-| `komari.conf` | **你只需要改这个**：面板地址 + token（后面自己填） |
+| `komari.conf` | **你只需要改这个**：面板地址 + token + `CPU_LIMIT`（后面自己填） |
 | `proc-shim.sh` | 容器感知核心：从 cgroup 读真值，生成影子 `/proc` |
+| `cpu-limit.sh` | **CPU 硬上限**：纯 shell 占空比节流，把主进程压在 `CPU_LIMIT%` 内 |
+| `prebuilt-lib.js` | 预编译好的前端产物（1.9 MB），用来跳过 205 秒满核 webpack 编译 |
+| `prebuilt-lib.js.sha` | 产物对应的 `public/lib.js` 哈希，源码版本不符时自动回退到现场编译 |
+| `prebuilt-patch.js` | 一次性给 SillyTavern 打最小补丁，在运行时把产物放到正确目录并跳过编译 |
 | `.gitignore` | 排除凭据、二进制、源码（避免公开仓库带 token） |
 | `README.md` | 本文 |
 
@@ -57,18 +62,26 @@ KOMARI_TOKEN=粘贴面板添加节点后给出的那串 token   # 原为空
 > 两项都填了探针才会启动；只填一个（或还留着 `YOUR_PANEL_DOMAIN`）探针会跳过，酒馆照常能开。
 > 保存后重启服务器。也可以不改文件，直接在 Wispbyte 环境变量里设 `AGENT_ENDPOINT` / `AGENT_TOKEN`（优先级更高）。
 
+`CPU_LIMIT` 是**CPU 上限**（默认 `25`，单位 %）——站内通知「平均 CPU 37.03% → 服务器已停止」就是它要防的。
+**不用改，默认就行**；详见「三·六」。想临时关掉可设 `0` 或环境变量 `CPU_LIMIT=0`（有再次被停服的风险）。
+
 > `REPORT_INTERVAL` 别设成 1：影子目录固定每 1 秒刷新一次，agent 采样间隔必须大于它，否则可能两次采样读到同一份 `stat`、CPU 使用率算成 0。默认 3 即可。
 
 ---
 
 ## 三、验收（按顺序看）
 
-1. **Console 日志**出现这三行就说明链路起来了：
+1. **Console 日志**出现这几行就说明链路起来了：
    ```
+   [start] 源码与预编译产物匹配，跳过 webpack 编译（省约 205 秒满核 / 避免 CPU 停服）
+   [start] 启动 SillyTavern（CPU 上限 25%，跳过编译=1）...
+   [start] CPU 节流器已启动：pid=... 上限=25%
+   [prebuilt] webpack compile skipped -> .../dist/_webpack/.../output/lib.js
    [proc-shim] mem=xxx/512 MB cores=1 cpu.usage=... HOST_PROC=/home/container/.proc-shim
    [start] komari-agent 已启动 pid=...
-   [start] 面板里应看到：内存≈容器限额、CPU核数≈配额核数
    ```
+   > 看到 `源码与预编译产物匹配` + `CPU 节流器已启动` 就说明**不会再因 CPU 被停服**；
+   > 若看到 `回退现场编译` 也不慌，节流器仍在，只是首次要多等几分钟。
 2. **Komari 面板**：节点上线，内存总量 ≈ 512 MB（不是几十 GB），CPU 核数 ≈ 配额核数（不是 32/64），CPU 使用率随聊天/导入卡波动。
 3. **酒馆**：打开分配的 `IP:端口`，先弹 BasicAuth（用户 `admin`，密码在 `SillyTavern/config.yaml`，或环境变量 `ST_USER`/`ST_PASS` 自定义），导卡发一句话看回复是否完整。
 4. 想确认探针读到的是不是容器值，可在 Console 直接跑：
@@ -139,6 +152,62 @@ CPU 使用率从恒定 0.001% 变为真实随负载波动。
 
 由此得出最关键一条：**编译一次成功后，务必让 `dist/_webpack` 缓存留在盘上**。之后重启是 2 秒 / 300MB，安全；若缓存丢失被迫重编译，在真 512MB 下就会 OOM。所以别删 `dist/`、别删 `.git`、别手动清空源码目录。
 
+> 补充纠正：日志末尾的 `Server marked as offline` **不是崩溃、也不是 OOM**，而是平台因「平均 CPU 使用率过高」主动停服（见下一节）。内存和 CPU 是两个独立的坑。
+
+---
+
+## 三·六、CPU 限额：为什么会被平台停服，以及怎么防（重要）
+
+### 症状与真实原因
+
+站内通知原文：
+
+> 由于 CPU 使用率过高，服务器已停止，平均 cpu 比例 37.03%
+
+**我上一轮把日志末尾的 `Server marked as offline` 判断成「停止动作、不是崩溃」，这是错的**——那是平台按公平使用策略主动停服，不是你手动停、也不是 OOM。
+
+Wispbyte 免费档的规则（官网 + KB）：免费服务器**前 ~90 秒给满核**专门让 `npm install` 别太慢，之后限速；Fair Use Policy 要求 CPU 保持在限额内，判据是**一段时间的平均 CPU 比例**，实测平均 **37.03%** 即触发停服。
+
+根因在 SillyTavern 源码：`src/server-main.js` 里的
+`await webpackMiddleware.runWebpackCompiler({ pruneCache: true })` 是**无条件调用**，没有任何跳过开关，每次启动都现场编译前端。在 1 核免费容器上这一步实测 **205561 ms（约 3.4 分钟）满核**，日志顺序正好是 `compiled successfully` → `listening` → `stopping` → `offline`。这段持续满核把平均 CPU 拉过阈值，于是编译刚完就被停。
+
+### 两层防护
+
+| 层 | 做法 | 效果 |
+|---|---|---|
+| **① 从根上不编译** | 随包带 `prebuilt-lib.js`（1.9 MB 已编译前端产物）。`start.sh` 用 `prebuilt-lib.js.sha` 校验当前 `public/lib.js` 哈希，匹配则由 `prebuilt-patch.js` 给源码打一个最小补丁，运行时把产物放进 webpack 的 output 目录并**跳过编译** | 首次启动从 **205 秒 → 6 秒**，满核尖峰直接消失 |
+| **② CPU 硬上限兜底** | `cpu-limit.sh` 用 `SIGSTOP/SIGCONT` 占空比把酒馆主进程（独立进程组）压在 `CPU_LIMIT%` 内，纯 shell，无需 `cpulimit` 或 cgroup 权限 | 即使源码版本变了、补丁没匹配上必须现场编译，或运行时突发峰值，平均 CPU 也**不会再超阈值** |
+
+两层是「或」的关系：**版本匹配走 ①（最省事），不匹配自动回退到现场编译但仍有 ② 兜底**，不会挂。补丁只改 `src/middleware/webpack-serve.js` 一处、幂等，产物路径由 `getPublicLibConfig()` 在运行时算出，不写死 hash 目录名，换 gitRevision / 换 dataRoot 都不会放错位置。
+
+### 实测数据（本机 1GB tmpfs 硬约束 + 全新无缓存源码）
+
+| 场景 | 结果 |
+|---|---|
+| 原版首次启动 | 编译约 205 秒（1 核满跑）→ 平均 CPU 37.03% → **停服** |
+| 改版首次启动 | **6 秒 listening**，`[prebuilt] webpack compile skipped`，无 `Compiling` 行 |
+| `GET /` / `GET /lib.js` | 200 / 200（734 KB / 1.9 MB），前端完全正常 |
+| 节流器精度 | 设 25% → 实测 **25.2%**；设 40% → 40.2%；不节流 100% |
+| 磁盘 | 427 MB / 1.0 GB，无异常 |
+| 探针 | basicInfo 8192 MiB / 4 核 / docker（仍是容器值，未被节流误伤） |
+
+节流器只作用于 `setsid` 拉起的**酒馆主进程组**；`proc-shim.sh`、`komari-agent` 在别的进程组，不受影响。
+
+### 配置与代价
+
+`komari.conf` 里 `CPU_LIMIT=25`（也可用平台环境变量 `CPU_LIMIT` 覆盖，优先级更高）：
+
+- `25`（默认）：低于触发值 37.03%，留足余量。
+- `0`：完全不节流，响应最跟手，但**有再次被停服的风险**。
+- `1`~`99`：按百分比，**别设到 37 以上**。
+- 代价：200 ms 周期里最多暂停 150 ms，聊天/导卡几乎无感；只在真有 CPU 负载时才表现为「慢一点」。
+
+### 你现在最省事的动作
+
+**重启一次服务器就行**：你日志里 `compiled successfully` 已经成功，`dist/_webpack` 缓存已落在盘上（Wispbyte 磁盘持久化），重启会命中缓存、2 秒起来，不会再有那 205 秒满核。
+
+但要让防护长期生效，仍建议**重新拉一次这个仓库**（或至少覆盖 `start.sh`、`cpu-limit.sh`、`prebuilt-lib.js`、`prebuilt-lib.js.sha`、`prebuilt-patch.js`），这样以后重装、缓存丢失或平台重建容器也不会再被停。
+
 ---
 
 ## 四、为什么不会探到宿主机（原理）
@@ -198,8 +267,11 @@ Komari 官方 agent **不感知 cgroup**：`Ram()` 直接读 `/proc/meminfo`，`
 | CPU 使用率恒为 0 / 0.001% | shim 没在刷新：日志里 `[proc-shim]` 行应每秒持续出现；确认 `REPORT_INTERVAL` > 1；删掉 `.proc-shim/` 重启以重建 CPU 基准 |
 | 酒馆打不开 / Forbidden | 确认 `config.yaml` 里 `whitelistMode: false`；端口是否等于面板分配端口 |
 | 磁盘占用 40% 多 / 接近满 | **40% 是正常稳态**（`node_modules` 334M 是刚性依赖，别删）。真凶是 npm 缓存累积：`$HOME/.npm/_cacache` 只增不减。`start.sh` 已每次自动清；也可在 Console 手动跑 `du -sh ~/.npm 2>/dev/null; rm -rf ~/.npm/_cacache ~/.npm/_logs /tmp/npm-*` 立即释放。别导大世界书/图片包 |
-| `Compiling frontend libraries...` 卡很久 / 面板判离线 | 1 核首次编译实测约 **205 秒**、峰值近 1GB 内存，属正常，别反复重启（重启会丢缓存又要重编）。等它出现 `compiled successfully` + `listening` 即可；之后重启仅 2 秒。**别删 `dist/_webpack` 和 `.git`** |
-| `Server marked as offline` 且日志无报错 | 多为平台在编译/空闲超时后主动停服，或内存瞬时超限；确认上一行有 `listening` 就说明酒馆其实起来了。重开后若 2 秒内再次 `listening` 即缓存命中、正常 |
+| 站内通知「**由于 CPU 使用率过高，服务器已停止，平均 cpu 比例 37.03%**」 | 平台按平均 CPU 停服，根因是首次 webpack 编译满核 205 秒。见「三·六」：拉新版包（带 `prebuilt-lib.js` + `cpu-limit.sh`），或至少**重启一次**让已生成的编译缓存命中。别把 `CPU_LIMIT` 设到 37 以上 |
+| `Compiling frontend libraries...` 卡很久 / 面板判离线 | 说明预置产物没生效（版本不匹配或补丁失败），回退到现场编译了。1 核约 205 秒属正常；此时 CPU 节流器仍在工作，不会被停服但会慢。检查 Console 有没有 `源码与预编译产物匹配` 和 `prebuilt-lib.js` 是否在根目录。**别删 `dist/_webpack` 和 `.git`** |
+| `Server marked as offline` 且日志无报错 | 多半就是平台因平均 CPU 过高**主动停服**（见「三·六」），不是崩溃也不是 OOM。确认上一行有 `listening` 就说明酒馆其实起来了；重开后若 2 秒内再次 `listening` 即缓存命中。拉新版包后不再出现 |
+| 页面偶尔顿一下 / 首次启动变慢 | `cpu-limit.sh` 在削 CPU 峰值，200ms 周期最多暂停 150ms，聊天无感。想最快响应可在 `komari.conf` 设 `CPU_LIMIT=0`，但会失去停服保护 |
+| `prebuilt-lib.js` 版本不匹配、日志提示「回退现场编译」 | SillyTavern 升级改了 `public/lib.js`。不影响使用（有节流器兜底），或重新拉一次本仓库拿匹配的新产物 |
 | GitHub clone 失败 | 改用 Wispbyte 网页文件管理器上传 SillyTavern 源码包到 `SillyTavern/` |
 
 ## 七、安全
