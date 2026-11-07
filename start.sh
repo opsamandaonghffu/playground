@@ -25,7 +25,24 @@ log() { printf '[start] %s\n' "$*" | tee -a "$LOG"; }
 log "启动，工作目录=$BASE，内核=$(uname -srm 2>/dev/null || echo unknown)"
 
 # -----------------------------------------------------------------------------
-# 0) 读取用户配置
+# 0) 每次启动清理「可再生缓存」—— 1GB 磁盘档的关键
+#    npm install 的下载缓存默认落在 $HOME/.npm，多次重装会不断累积（实测沙箱
+#    累积到 1.3GB），这是撑满 1GB 配额的头号元凶。这些全是可再生文件，删掉不影响
+#    已装好的 node_modules，也不影响运行；下次 npm install 会按需重新下载。
+# -----------------------------------------------------------------------------
+cleanup_disk() {
+    rm -rf "$BASE/.npm-cache" 2>/dev/null
+    for d in "${HOME:-}" "$BASE" /home/container; do
+        [ -n "$d" ] || continue
+        rm -rf "$d/.npm/_cacache" "$d/.npm/_logs" 2>/dev/null
+    done
+    rm -rf /tmp/npm-* 2>/dev/null
+}
+cleanup_disk
+log "磁盘清理完成，当前占用：$(du -sh "$BASE" 2>/dev/null | awk '{print $1}')（node_modules 属刚性依赖，勿删）"
+
+# -----------------------------------------------------------------------------
+# 1) 读取用户配置
 # -----------------------------------------------------------------------------
 KOMARI_ENDPOINT=""; KOMARI_TOKEN=""; IGNORE_CERT=0; REPORT_INTERVAL=3; NODE_NAME=""
 if [ -r "$CONF" ]; then
@@ -45,6 +62,10 @@ if [ ! -f "$ST_DIR/server.js" ]; then
     if command -v git >/dev/null 2>&1; then
         git clone --depth 1 -b release https://github.com/SillyTavern/SillyTavern.git "$ST_DIR" \
             >>"$LOG" 2>&1 || log "git clone 失败（可改用网页上传源码包）"
+        # 注意：不要删 .git！webpack 缓存目录名由 [pkgVersion, gitRevision, webpack.version]
+        # 哈希而来，gitRevision 来自 git.revparse。删了 .git 会让它变 null、缓存 key 改变，
+        # 导致下次启动重新全量编译（1核约205秒/峰值近1GB内存，512MB 下会 OOM）。
+        # 37MB 的 .git 换来这个风险不划算，留着。
     else
         log "镜像里没有 git：请改用 Wispbyte 网页文件管理器上传 SillyTavern 源码到 $ST_DIR"
     fi
@@ -52,9 +73,17 @@ fi
 
 if [ -f "$ST_DIR/package.json" ] && [ ! -d "$ST_DIR/node_modules" ]; then
     log "首次启动：安装依赖 npm install --omit=dev（这一步可能要几分钟）..."
-    ( cd "$ST_DIR" && npm install --omit=dev --no-audit --no-fund ) >>"$LOG" 2>&1 \
+    # 省盘：npm 缓存默认落在 HOME/.npm，实测 86 MB+，且多次重装会不断累积撑满 1GB。
+    # 显式指定缓存目录，装完立即删除，保证稳态干净（不依赖容器 HOME 在哪）。
+    NPM_CACHE="$BASE/.npm-cache"
+    ( cd "$ST_DIR" && npm_config_cache="$NPM_CACHE" npm install --omit=dev --no-audit --no-fund ) >>"$LOG" 2>&1 \
         || log "npm install 失败，酒馆可能起不来，详见 $LOG"
+    rm -rf "$NPM_CACHE"
+    log "已清理 npm 缓存（省约 86 MB+）"
 fi
+
+# 别删 SillyTavern/dist 与 data/_webpack：那是 webpack 前端编译缓存（约 14 MB）。
+# 1 核容器首次编译要 ~205 秒 / 峰值近 1 GB 内存；有缓存后重启仅 2 秒 / 300 MB。
 
 # 生成 SillyTavern 的 config.yaml（端口对接面板、关白名单、开 BasicAuth）
 if [ -f "$ST_DIR/server.js" ]; then
@@ -78,6 +107,8 @@ basicAuthUser:
   password: $ST_PASS
 enableCorsProxy: false
 disableCsrf: false
+browserLaunch:
+  enabled: false
 EOF
     log "SillyTavern 配置就绪：port=$PORT user=$ST_USER（密码见 $ST_DIR/config.yaml）"
 fi

@@ -11,7 +11,8 @@
 
 | 文件 | 作用 |
 |---|---|
-| `start.sh` | **唯一入口**，Wispbyte Startup Command 填 `sh /home/container/start.sh` |
+| `start.sh` | **主入口**，Startup Command 填 `sh /home/container/start.sh` |
+| `index.js` | **兜底入口**：面板只允许指定 `node <主文件>` 时，把主文件指向它，由它转交 `start.sh` |
 | `komari.conf` | **你只需要改这个**：面板地址 + token（后面自己填） |
 | `proc-shim.sh` | 容器感知核心：从 cgroup 读真值，生成影子 `/proc` |
 | `.gitignore` | 排除凭据、二进制、源码（避免公开仓库带 token） |
@@ -24,15 +25,25 @@
 ## 二、部署三步
 
 ### 1. 建服务器
-- 镜像选 **Node.js 20 或 22**（SillyTavern 要求 Node ≥ 20）
-- 把本仓库文件放进 `/home/container/`（GitHub 集成拉取，或网页文件管理器上传）
+- 镜像选 **Node.js 20 或 22**。SillyTavern 的 `engines` 是 `node >= 20`；若平台实际给的是 **v19.x**，`npm install` 会报 `EBADENGINE` 警告，建议到 **Startup → Docker image** 选 `nodejs_22` 并点 **Use this image**（改镜像要重启）。
+- 把本仓库文件放进容器根目录（GitHub 集成拉取，或网页文件管理器上传）。**Files 面板打开就是这些文件，看不到 `/home/container` 这一层是正常的**——它就是当前目录，别新建同名文件夹。
 
-### 2. Startup Command 填一条
+### 2. Startup：把启动命令改成 sh
+
+进 **Startup** 页，点右上角 **✏️ Edit**，把默认那一整条（结尾是 `/usr/local/bin/node /home/container/start.sh`）**整条删空**，只填：
+
 ```
 sh /home/container/start.sh
 ```
-> 端口不用管，`start.sh` 会探测 `SERVER_PORT` / `PORT` / `P_PORT`，默认 8000，并自动写进酒馆 `config.yaml`。
-> 若面板的端口变量名是别的，在 Wispbyte 环境变量里加 `SERVER_PORT=<分配的端口>` 即可。
+
+保存后重启。
+
+> ⚠️ **别把「主文件 / JS_FILE」变量指向 `start.sh`**：这个镜像固定用 `node <主文件>` 启动，会把 `.sh` 当 JS 解析，报 `SyntaxError: Invalid or unexpected token`（指向 `start.sh:2`）。
+> 若面板不允许整条编辑、只能改变量值，就把主文件改成 **`index.js`**（包里已附，它内部转交 `start.sh`，代价是多一个常驻 node 进程）。
+> 相对路径 `sh start.sh` 也行——`start.sh` 用自身所在目录定位同伴文件。
+
+> 端口不用管，`start.sh` 会探测 `SERVER_PORT` / `PORT` / `P_PORT`，默认 8000，并自动写进酒馆 `config.yaml`。若面板端口变量名不同，在 **Environment** 里加 `SERVER_PORT=<分配的端口>`。
+> 整条替换后，平台原来那段 `git pull` / `npm install` 会一起消失，没关系——`start.sh` 自己会 clone + install。**Packages** 保持空。
 
 ### 3. 填 `komari.conf`（可以后填，不影响酒馆启动）
 
@@ -91,6 +102,45 @@ CPU 使用率从恒定 0.001% 变为真实随负载波动。
 
 ---
 
+## 三·五、1GB 磁盘 / 512MB 内存实测（重要）
+
+在沙箱里造了 **1GB tmpfs 磁盘 + 512MB cgroup 内存硬限制**，1:1 复现首次安装与编译，逐项量过。
+
+### 磁盘账单（SillyTavern 1.19.0 release）
+
+| 阶段 / 组成 | 占用 | 占 1GB |
+|---|---|---|
+| `git clone --depth 1` 后（含 `.git` 37M） | 98M | 10% |
+| 装完依赖 `node_modules` | 334M | 33% |
+| `npm install` 产生的缓存 | 86M | 8% |
+| **安装瞬间峰值**（源码+`.git`+依赖+缓存） | **518M** | **51%** |
+| webpack 编译产物 `dist/_webpack` | 14M | 1.4% |
+| komari-agent 二进制 | 12M | 1.2% |
+| **清理缓存后的稳态** | **≈ 396M** | **≈ 40%** |
+
+> **你看到的「40% 多」是正常的稳态，不是磁盘满了。** 稳态里 `node_modules` 一项就占 334M（`onnxruntime-web` 66M + `sillytavern-transformers` 53M + `tiktoken` 23M 等），这是刚性依赖，删了启动直接报错，别动。
+
+**真正把 1GB 撑满的是 npm 缓存累积**：`npm install` 的下载缓存默认落在 `$HOME/.npm`，多次重装只增不减（实测沙箱累积到 1.3GB），远超单次那 86M。`start.sh` 现在每次启动都会清 `$HOME/.npm/_cacache`、`_logs`、`/tmp/npm-*`，并把首次安装的缓存指定到独立目录、装完即删。
+
+另外两处别删：
+- **`.git`（37M）**：webpack 缓存目录名由 `[pkgVersion, gitRevision, webpack.version]` 哈希而来，`gitRevision` 来自 `git.revparse`。删了 `.git` 会让它变 `null`、缓存 key 改变，下次启动**重新全量编译**。
+- **`SillyTavern/dist/_webpack`（14M）**：前端编译缓存，删了每次重启都要重编译。
+
+### 内存真相（512MB 是最大风险，不是磁盘）
+
+| 场景 | 峰值 VmRSS | 结果 |
+|---|---|---|
+| 内存放宽 3G + 首次编译 | **966 MiB** | 编译成功，产物 14M |
+| **512MB 硬限 + 首次编译（不限堆）** | 524 MiB | **6 秒 OOM 被杀** |
+| 512MB 硬限 + 首次编译 + `--max-old-space-size=320` | 542 MiB | **5 秒 OOM 被杀（限堆无效）** |
+| **512MB 硬限 + 已有 webpack 缓存、重启** | **300 MiB** | **2 秒启动，稳过** |
+
+`Compiling frontend libraries...` 那一步 webpack 峰值接近 1GB，且主要来自 Buffer/原生内存，`--max-old-space-size` 压不住。**你日志里能 `compiled successfully in 205561 ms` 并 listening，说明 Wispbyte 实际给的内存超过标称 512MB（或有 swap/未硬限），不是真卡死。**
+
+由此得出最关键一条：**编译一次成功后，务必让 `dist/_webpack` 缓存留在盘上**。之后重启是 2 秒 / 300MB，安全；若缓存丢失被迫重编译，在真 512MB 下就会 OOM。所以别删 `dist/`、别删 `.git`、别手动清空源码目录。
+
+---
+
 ## 四、为什么不会探到宿主机（原理）
 
 Komari 官方 agent **不感知 cgroup**：`Ram()` 直接读 `/proc/meminfo`，`Cpu()` 用 `cpu.Counts()`，
@@ -139,13 +189,17 @@ Komari 官方 agent **不感知 cgroup**：`Ram()` 直接读 `/proc/meminfo`，`
 
 | 现象 | 原因 / 处理 |
 |---|---|
+| **`SyntaxError: Invalid or unexpected token`，指向 `start.sh:2`** | 主文件 / `JS_FILE` 被设成了 `start.sh`，平台用 `node` 把它当 JS 跑。见「二、2」：Startup 点 Edit 整条改成 `sh /home/container/start.sh`，或把主文件改为 `index.js` |
+| `EBADENGINE` / `npm WARN EBADENGINE`、Node 是 v19.x | SillyTavern 要求 `node >= 20`。Startup → Docker image 选 `nodejs_22` → **Use this image** → 重启 |
 | 面板不显示节点 | 先看 `komari-agent.log`；多半是 token 没填、面板地址没带 `https://`、或容器出站连不上面板域名 |
 | 日志刷 `Failed to connect to WebSocket: 404` | 面板反代没放开 WebSocket，属正常；已设 `max_retries: 2` / `reconnect_interval: 2`，约 6 秒自动切 v2 POST fallback，确认日志出现 `Entering v2 POST fallback mode` 后数据照常上报 |
 | 自签证书报错 | `komari.conf` 里 `IGNORE_CERT=1` |
 | 内存仍显示几十 GB | 说明 `HOST_PROC` 没生效：确认 Startup Command 是 `sh start.sh`（不是 `node server.js`），日志有没有 `[proc-shim]` 行 |
 | CPU 使用率恒为 0 / 0.001% | shim 没在刷新：日志里 `[proc-shim]` 行应每秒持续出现；确认 `REPORT_INTERVAL` > 1；删掉 `.proc-shim/` 重启以重建 CPU 基准 |
 | 酒馆打不开 / Forbidden | 确认 `config.yaml` 里 `whitelistMode: false`；端口是否等于面板分配端口 |
-| `npm install` 失败 / 磁盘满 | 1 GB 很紧；删掉 `.proc-shim/` 日志、避免装扩展和大世界书 |
+| 磁盘占用 40% 多 / 接近满 | **40% 是正常稳态**（`node_modules` 334M 是刚性依赖，别删）。真凶是 npm 缓存累积：`$HOME/.npm/_cacache` 只增不减。`start.sh` 已每次自动清；也可在 Console 手动跑 `du -sh ~/.npm 2>/dev/null; rm -rf ~/.npm/_cacache ~/.npm/_logs /tmp/npm-*` 立即释放。别导大世界书/图片包 |
+| `Compiling frontend libraries...` 卡很久 / 面板判离线 | 1 核首次编译实测约 **205 秒**、峰值近 1GB 内存，属正常，别反复重启（重启会丢缓存又要重编）。等它出现 `compiled successfully` + `listening` 即可；之后重启仅 2 秒。**别删 `dist/_webpack` 和 `.git`** |
+| `Server marked as offline` 且日志无报错 | 多为平台在编译/空闲超时后主动停服，或内存瞬时超限；确认上一行有 `listening` 就说明酒馆其实起来了。重开后若 2 秒内再次 `listening` 即缓存命中、正常 |
 | GitHub clone 失败 | 改用 Wispbyte 网页文件管理器上传 SillyTavern 源码包到 `SillyTavern/` |
 
 ## 七、安全
